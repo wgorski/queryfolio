@@ -48,6 +48,9 @@ export interface ConnectionInfo {
   allow_dangerous_statements: boolean;
   /// 接続一覧での表示グループ名 (グループ未所属なら null)
   group_name: string | null;
+  /// パスワードを password_command で取得する接続か
+  /// (コマンドの文字列も出力も渡されない)
+  password_from_command: boolean;
   /// SQL 系エンジン (mysql / postgres) の実効 TLS モード。
   /// disable / prefer は平文へ降格しうる (prefer は sqlx の既定)。
   /// 他のエンジンでは null

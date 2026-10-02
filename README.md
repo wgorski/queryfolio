@@ -21,6 +21,7 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 - SSH tunnel with known_hosts verification
 - Connection config in YAML, compatible with the sql-agent-mcp-server format
   - Secrets can stay in 1Password: the config YAML is fetched lazily via a getter command like `op read "op://..."`
+  - Per-connection `password_command`: fetch a password when that connection is opened (e.g. AWS RDS IAM auth tokens), with one automatic retry when an expired token is rejected (PostgreSQL / MySQL)
 - Query files per connection, auto-saved (`~/.config/queryfolio/sqlfiles/<folder>/*.sql`, where `<folder>` is `folder_name` or `<host>_<engine>_<schema>_<user>`)
 - CodeMirror 6 SQL editor with per-engine dialect, statement highlighting, Cmd+Enter to run the statement under the cursor, and schema-based autocompletion (table / column names; Tab or Enter accepts a suggestion)
 - SQL formatting for SELECT statements (conservative: unsupported or unparsable statements are left untouched)

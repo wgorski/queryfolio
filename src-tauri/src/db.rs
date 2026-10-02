@@ -65,8 +65,13 @@ pub struct QueryResult {
 }
 
 /// 接続名ごとのプールと SSH トンネルを保持するマネージャ。
-/// 単一ユーザーのデスクトップアプリなので、プール取得全体を 1 つの
-/// tokio Mutex で直列化して二重生成を防ぐ。
+///
+/// 接続の確立 (SSH トンネル・password_command・DB への接続) は数秒かかり得る
+/// ため、マップ全体のロック (inner) を握ったままは行わない。握ったままだと、
+/// ある接続の password_command が認証待ちで止まっている間、確立済みの別の
+/// 接続のクエリまでプールの取り出しで待たされる。代わりに接続名ごとのロック
+/// (connect_locks) で同じ接続の確立だけを直列化し、二重生成を防ぐ。
+/// ロックの順序は常に connect_locks → inner (逆順で待たない)。
 #[derive(Default)]
 pub struct DbManager {
     inner: tokio::sync::Mutex<DbManagerInner>,
@@ -79,23 +84,65 @@ struct DbManagerInner {
     /// 接続名ごとのアクティブスキーマ (database) のオーバーライド。
     /// 設定の schema と異なる database に切り替えている時のみ存在する。
     schema_overrides: HashMap<String, String>,
+    /// 接続名ごとの「接続の確立」を直列化するロック。
+    /// プール・トンネルを破棄する操作 (disconnect / スキーマ切替) もこれを取り、
+    /// 確立の途中に割り込まない (確立が終わるのを待ってから破棄する)。
+    connect_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// reset (設定リロード) のたびに進む世代。reset は全接続が対象なので
+    /// 接続ごとのロックは取らず、確立中だった get_pool が古い設定で作った
+    /// プール・トンネルを登録しないよう、この世代で検知する。
+    reset_generation: u64,
+}
+
+impl DbManagerInner {
+    fn connect_lock(&mut self, connection: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.connect_locks
+            .entry(connection.to_string())
+            .or_default()
+            .clone()
+    }
 }
 
 impl DbManager {
-    pub async fn get_pool(&self, server: &ServerConfig) -> Result<DbPool, AppError> {
-        let mut inner = self.inner.lock().await;
-        if let Some(pool) = inner.pools.get(&server.name) {
-            return Ok(pool.clone());
-        }
+    /// 接続名ごとの確立ロックを返す (inner のロックは返す前に手放す)。
+    async fn connect_lock(&self, connection: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inner.lock().await.connect_lock(connection)
+    }
 
-        // アクティブスキーマが切り替えられていれば接続先 database を差し替える
-        let mut server = server.clone();
-        if let Some(schema) = inner.schema_overrides.get(&server.name) {
-            server.schema = Some(schema.clone());
-        }
-        let server = &server;
+    pub async fn get_pool(&self, server: &ServerConfig) -> Result<DbPool, AppError> {
+        let connect_lock = {
+            let mut inner = self.inner.lock().await;
+            if let Some(pool) = inner.pools.get(&server.name) {
+                return Ok(pool.clone());
+            }
+            inner.connect_lock(&server.name)
+        };
+        let _connecting = connect_lock.lock().await;
+
+        // 確立ロックを待っている間に、同じ接続の別の呼び出しが張り終えている
+        // ことがある。その場合はそれを使う (password_command を二重に走らせない)
+        let (mut server, tunnel_port, generation) = {
+            let inner = self.inner.lock().await;
+            if let Some(pool) = inner.pools.get(&server.name) {
+                return Ok(pool.clone());
+            }
+            // アクティブスキーマが切り替えられていれば接続先 database を差し替える
+            let mut server = server.clone();
+            if let Some(schema) = inner.schema_overrides.get(&server.name) {
+                server.schema = Some(schema.clone());
+            }
+            let tunnel_port = inner.tunnels.get(&server.name).map(|t| t.local_port);
+            (server, tunnel_port, inner.reset_generation)
+        };
 
         let engine = parse_engine(&server.engine)?;
+
+        // password_command は新しいプールを作る時にだけ実行する。結果は
+        // このプールの接続オプションにだけ渡り、他には保持しない。
+        // 複製した ServerConfig の password へ入れるので、server.password を
+        // 読む全エンジンがそのまま動く
+        resolve_password(&mut server).await?;
+        let server = &server;
 
         // SSH トンネルが必要なら先に確立し、接続先をローカルポートに差し替える
         let (host, port) = match (&server.ssh_tunnel, engine) {
@@ -120,8 +167,8 @@ impl DbManager {
             (Some(tunnel_config), _) => {
                 // スキーマ切替等でプールだけ破棄された場合、既存トンネルは
                 // 接続先ホストが同じなのでそのまま再利用する
-                let local_port = match inner.tunnels.get(&server.name) {
-                    Some(tunnel) => tunnel.local_port,
+                let local_port = match tunnel_port {
+                    Some(local_port) => local_port,
                     None => {
                         let target_host =
                             server.host.clone().unwrap_or_else(|| "localhost".into());
@@ -136,6 +183,19 @@ impl DbManager {
                             AppError::SshTunnel(format!("SSH tunnel task failed: {e}"))
                         })??;
                         let local_port = tunnel.local_port;
+                        // DB への接続に失敗してもトンネルは残し、次の試行で
+                        // 再利用する (プールより先に登録する)
+                        let mut inner = self.inner.lock().await;
+                        if inner.reset_generation != generation {
+                            // 確立中に設定リロードが挟まった。古い設定のトンネルは
+                            // 登録できず、ここで閉じるので、それを使うプールも
+                            // 作れない
+                            return Err(AppError::Config(format!(
+                                "The config was reloaded while connecting to '{}'. \
+                                 Run it again.",
+                                server.name
+                            )));
+                        }
                         inner.tunnels.insert(server.name.clone(), tunnel);
                         local_port
                     }
@@ -149,13 +209,118 @@ impl DbManager {
         };
 
         let pool = connect(server, engine, &host, port).await?;
-        inner.pools.insert(server.name.clone(), pool.clone());
+        let mut inner = self.inner.lock().await;
+        // 確立中に設定リロードが挟まっていたら、古い設定で張ったプールは
+        // 登録しない (この呼び出しには返す。次の呼び出しは新しい設定で張り直す)
+        if inner.reset_generation == generation {
+            inner.pools.insert(server.name.clone(), pool.clone());
+        }
         Ok(pool)
+    }
+
+    /// 接続を pool 上で実行し、password_command で取得したパスワードの期限切れ
+    /// (認証エラー) なら、パスワードを取り直して 1 度だけ再実行する。
+    ///
+    /// sqlx のプールは後から新しいコネクションを張る時にも作成時の接続オプション
+    /// (= 当時のパスワード) を使うため、RDS の IAM 認証トークン (有効 15 分) で
+    /// 作ったプールは、既存のコネクションが生きていても新しいコネクションから
+    /// 失敗し始める。認証エラーは接続の確立時にしか起きず、文は実行されて
+    /// いないので、再実行しても二重実行にはならない。
+    ///
+    /// 静的な password の接続は再実行しない (取り直しても同じ値なので)。
+    pub async fn with_pool<T, F, Fut>(&self, server: &ServerConfig, run: F) -> Result<T, AppError>
+    where
+        F: Fn(DbPool) -> Fut,
+        Fut: std::future::Future<Output = Result<T, AppError>>,
+    {
+        let pool = self.get_pool(server).await?;
+        self.retry_on_expired_password(server, pool, run).await
+    }
+
+    /// with_pool の、プールを取得済みの呼び出し側向け版
+    /// (プール取得と実行の間に別の処理を挟む AI チャット用)。
+    pub async fn retry_on_expired_password<T, F, Fut>(
+        &self,
+        server: &ServerConfig,
+        pool: DbPool,
+        run: F,
+    ) -> Result<T, AppError>
+    where
+        F: Fn(DbPool) -> Fut,
+        Fut: std::future::Future<Output = Result<T, AppError>>,
+    {
+        let uses_password_command = server.password_command.is_some();
+        let mut retried = false;
+        loop {
+            let error = match run(pool.clone()).await {
+                Err(error)
+                    if should_retry_with_fresh_password(
+                        uses_password_command,
+                        retried,
+                        db_error_code(&error),
+                    ) =>
+                {
+                    error
+                }
+                // 成功・認証以外のエラー・再試行後の失敗はそのまま返す
+                result => return result,
+            };
+            eprintln!(
+                "[db] '{}': authentication failed, re-running password_command and retrying once",
+                server.name
+            );
+            // 取り直しに失敗したら、そちらの理由 (コマンドのエラー) も返す。
+            // 元の認証エラーだけ返すと、トークン取得側の問題 (SSO の期限切れ等) に
+            // 気付けない
+            self.refresh_password(server, &pool).await.map_err(|refresh_error| {
+                AppError::Config(format!(
+                    "{error}\nRe-running password_command failed: {refresh_error}"
+                ))
+            })?;
+            retried = true;
+        }
+    }
+
+    /// password_command を実行し直し、pool がこれから張るコネクションの
+    /// パスワードを差し替える。
+    ///
+    /// プールは作り直さず `Pool::set_connect_options` で差し替える。作り直すと
+    /// (1) 既に渡したプールの複製 (キャンセル発行用に CancelTarget が持つもの等) が
+    /// 古いパスワードのまま残り、(2) 認証済みで生きている既存コネクションまで
+    /// 捨てることになる。差し替えならプールを共有する全ての複製に効き、既存の
+    /// コネクションはそのまま使える。SSH トンネルにも触れない (接続先は同じ
+    /// ローカルポートのまま)。接続オプションはプール自身が持っているものを
+    /// 複製してパスワードだけ変えるので、トンネルの解決や TLS 設定をやり直す
+    /// 必要も無い。
+    async fn refresh_password(&self, server: &ServerConfig, pool: &DbPool) -> Result<(), AppError> {
+        let Some(command) = server.password_command()? else {
+            return Ok(());
+        };
+        let password = crate::config::run_password_command(&server.name, command).await?;
+        match pool {
+            DbPool::Postgres(pool) => {
+                let options = (*pool.connect_options()).clone().password(&password);
+                pool.set_connect_options(options);
+            }
+            DbPool::MySql(pool) => {
+                let options = (*pool.connect_options()).clone().password(&password);
+                pool.set_connect_options(options);
+            }
+            // 認証エラーの再試行は Postgres / MySQL だけが対象
+            // (should_retry_with_fresh_password)
+            DbPool::Sqlite(_)
+            | DbPool::Redis(_)
+            | DbPool::Elasticsearch(_)
+            | DbPool::DuckDb(_)
+            | DbPool::DynamoDb(_) => {}
+        }
+        Ok(())
     }
 
     /// プールとトンネルを全て破棄する。設定リロード時に呼ぶ。
     pub async fn reset(&self) {
         let mut inner = self.inner.lock().await;
+        inner.reset_generation += 1;
         inner.pools.clear();
         inner.tunnels.clear();
         inner.schema_overrides.clear();
@@ -169,6 +334,9 @@ impl DbManager {
     /// アクティブスキーマの選択 (schema_overrides) は UI の状態なので保持し、
     /// 次に接続を張り直した時に同じスキーマで繋がるようにする。
     pub async fn disconnect(&self, connection: &str) {
+        // 確立の途中なら終わるのを待ってから破棄する
+        let connect_lock = self.connect_lock(connection).await;
+        let _connecting = connect_lock.lock().await;
         let mut inner = self.inner.lock().await;
         inner.pools.remove(connection);
         inner.tunnels.remove(connection);
@@ -186,6 +354,10 @@ impl DbManager {
     /// アクティブスキーマのオーバーライドを設定または解除する。
     /// None を渡すと設定ファイルの schema に戻る。
     async fn replace_schema_override(&self, connection: &str, schema: Option<String>) {
+        // 確立中のプールは切替前のスキーマで張られるので、確立が終わってから
+        // それを破棄する (割り込むと切替前のスキーマのプールが登録され残る)
+        let connect_lock = self.connect_lock(connection).await;
+        let _connecting = connect_lock.lock().await;
         let mut inner = self.inner.lock().await;
         match schema {
             Some(schema) => {
@@ -211,6 +383,8 @@ impl DbManager {
         expected: &str,
         previous: Option<String>,
     ) -> bool {
+        let connect_lock = self.connect_lock(connection).await;
+        let _connecting = connect_lock.lock().await;
         // 判定と書き戻しの間に割り込まれないよう、同じロックスコープで行う
         let mut inner = self.inner.lock().await;
         if inner.schema_overrides.get(connection).map(String::as_str) != Some(expected) {
@@ -466,6 +640,63 @@ pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
              elasticsearch / dynamodb)"
         ))),
     }
+}
+
+/// password_command があれば実行し、その結果を server.password に入れる
+/// (server は get_pool が複製したもの。設定のキャッシュには書き戻さない)。
+async fn resolve_password(server: &mut ServerConfig) -> Result<(), AppError> {
+    if let Some(command) = server.password_command()?.map(str::to_string) {
+        let password = crate::config::run_password_command(&server.name, &command).await?;
+        server.password = Some(password);
+    }
+    Ok(())
+}
+
+/// DB のエラーコード (認証エラーの判定用)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DbErrorCode<'a> {
+    /// Postgres の SQLSTATE
+    Postgres(&'a str),
+    /// MySQL のエラー番号 (SQLSTATE より細かい)
+    MySql(u16),
+    /// それ以外 (DB のエラーでない・他のエンジン)
+    Other,
+}
+
+/// 認証の失敗を表すエラーコードか。
+/// - Postgres: 28P01 (invalid_password。期限切れの IAM トークンもこれ) /
+///   28000 (invalid_authorization_specification。pg_hba で拒否された等)
+/// - MySQL: 1045 (ER_ACCESS_DENIED_ERROR)
+pub(crate) fn is_auth_failure_code(code: DbErrorCode<'_>) -> bool {
+    match code {
+        DbErrorCode::Postgres(sqlstate) => matches!(sqlstate, "28P01" | "28000"),
+        DbErrorCode::MySql(number) => number == 1045,
+        DbErrorCode::Other => false,
+    }
+}
+
+fn db_error_code(error: &AppError) -> DbErrorCode<'_> {
+    let AppError::Db(sqlx::Error::Database(db_error)) = error else {
+        return DbErrorCode::Other;
+    };
+    if let Some(pg) = db_error.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
+        return DbErrorCode::Postgres(pg.code());
+    }
+    if let Some(mysql) = db_error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>() {
+        return DbErrorCode::MySql(mysql.number());
+    }
+    DbErrorCode::Other
+}
+
+/// パスワードを取り直して再実行すべきか (DbManager::retry_on_expired_password)。
+/// password_command の接続で、まだ再実行しておらず、認証エラーで失敗した時だけ。
+/// 静的な password は取り直しても同じ値なので再実行しない。
+pub(crate) fn should_retry_with_fresh_password(
+    uses_password_command: bool,
+    already_retried: bool,
+    code: DbErrorCode<'_>,
+) -> bool {
+    uses_password_command && !already_retried && is_auth_failure_code(code)
 }
 
 fn default_port(engine: Engine) -> u16 {
@@ -3913,5 +4144,256 @@ mod tests {
         .to_string();
         // エージェント用のホワイトリスト (agent_rejection_reason) が先に弾く
         assert!(err.contains("assistant"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_auth_failure_codes() {
+        // Postgres: 28P01 (パスワード不一致。期限切れの IAM トークンもこれ) と 28000
+        assert!(is_auth_failure_code(DbErrorCode::Postgres("28P01")));
+        assert!(is_auth_failure_code(DbErrorCode::Postgres("28000")));
+        // 権限不足・接続数超過・起動中は認証の失敗ではない
+        for code in ["42501", "53300", "57P03", "3D000", "08006"] {
+            assert!(!is_auth_failure_code(DbErrorCode::Postgres(code)), "{code}");
+        }
+        // MySQL: 1045 (ER_ACCESS_DENIED_ERROR) だけ。1044 は database への権限不足
+        assert!(is_auth_failure_code(DbErrorCode::MySql(1045)));
+        for number in [1044, 1049, 1142, 2013] {
+            assert!(!is_auth_failure_code(DbErrorCode::MySql(number)), "{number}");
+        }
+        assert!(!is_auth_failure_code(DbErrorCode::Other));
+    }
+
+    #[test]
+    fn test_retry_decision() {
+        let auth = DbErrorCode::Postgres("28P01");
+        // password_command の接続で、まだ再試行していない認証エラーだけ
+        assert!(should_retry_with_fresh_password(true, false, auth));
+        assert!(should_retry_with_fresh_password(true, false, DbErrorCode::MySql(1045)));
+        // 再試行は 1 度だけ
+        assert!(!should_retry_with_fresh_password(true, true, auth));
+        // 静的な password は取り直しても同じなので再試行しない
+        assert!(!should_retry_with_fresh_password(false, false, auth));
+        // 認証以外のエラーは再試行しない
+        assert!(!should_retry_with_fresh_password(true, false, DbErrorCode::Postgres("42P01")));
+        assert!(!should_retry_with_fresh_password(true, false, DbErrorCode::Other));
+    }
+
+    #[test]
+    fn test_db_error_code_of_non_database_errors() {
+        assert_eq!(
+            db_error_code(&AppError::Config("x".into())),
+            DbErrorCode::Other
+        );
+        assert_eq!(
+            db_error_code(&AppError::Db(sqlx::Error::PoolTimedOut)),
+            DbErrorCode::Other
+        );
+    }
+
+    /// 認証以外のエラーは password_command の接続でも再実行しない
+    #[tokio::test]
+    async fn test_retry_on_expired_password_does_not_retry_other_errors() {
+        let manager = DbManager::default();
+        let server: ServerConfig = serde_yaml::from_str(
+            "name: c\nengine: postgres\npassword_command: /usr/bin/false\n",
+        )
+        .unwrap();
+        let pool = DbPool::Sqlite(
+            SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let calls = &calls;
+        let result: Result<(), AppError> = manager
+            .retry_on_expired_password(&server, pool, |_| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(AppError::Config("boom".into()))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 実 Postgres での password_command の検証 (QUERYFOLIO_TEST_PG_URL が無ければ
+    /// スキップ。接続ユーザには CREATEROLE が要る):
+    ///   QUERYFOLIO_TEST_PG_URL=postgres://postgres:pass@127.0.0.1:5432/postgres \
+    ///     cargo test test_password_command_against_postgres
+    /// パスワード認証 (scram-sha-256 / md5) の TCP 接続であること (trust だと
+    /// パスワードが変わっても弾かれず、再試行の検証にならない)。
+    /// 検証内容:
+    /// 1. password_command の出力で接続できる
+    /// 2. ロールのパスワードを変え、既存コネクションを切ると、次の取得は
+    ///    認証エラー → コマンドを取り直して 1 度だけ再試行し、新しい
+    ///    パスワードで繋がる (SSH トンネルは使わないが、プールは作り直さず
+    ///    同じプールのまま続く)
+    /// 3. 取り直しても違うパスワードなら、再試行は 1 回だけで失敗を返す
+    /// 4. 静的な password の接続は再試行しない
+    /// 一意な名前のロールを作り、最後に消す。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_against_postgres() {
+        use std::str::FromStr;
+
+        let Ok(url) = std::env::var("QUERYFOLIO_TEST_PG_URL") else {
+            return;
+        };
+        let admin = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        let target = PgConnectOptions::from_str(&url).unwrap();
+        let role = format!(
+            "queryfolio_pwcmd_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        sqlx::query(&format!("CREATE ROLE {role} LOGIN PASSWORD 'first-pw'"))
+            .execute(&admin)
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let password_file = dir.path().join("password");
+        let count_file = dir.path().join("count");
+        std::fs::write(&password_file, "first-pw\n").unwrap();
+        // 実行回数を数えつつ、ファイルの中身をパスワードとして出す
+        let command = format!(
+            "/bin/sh -c 'echo x >> {}; cat {}'",
+            count_file.display(),
+            password_file.display()
+        );
+        let runs = || {
+            std::fs::read_to_string(&count_file)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let yaml = format!(
+            "name: pwcmd\nengine: postgres\nhost: {}\nport: {}\nschema: {}\nuser: {role}\n\
+             ssl_mode: disable\npassword_command: \"{}\"\n",
+            target.get_host(),
+            target.get_port(),
+            target.get_database().unwrap_or("postgres"),
+            command.replace('"', "\\\"")
+        );
+        let server: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+
+        // 既存コネクションを全部切る (プールは次の取得で新しく張るしかなくなる)
+        let kick = || async {
+            sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1")
+                .bind(&role)
+                .execute(&admin)
+                .await
+                .unwrap();
+        };
+        let current_user = |pool: DbPool| async move {
+            let DbPool::Postgres(pool) = pool else { unreachable!() };
+            let user: String = sqlx::query_scalar("SELECT current_user::text")
+                .fetch_one(&pool)
+                .await?;
+            Ok::<_, AppError>(user)
+        };
+
+        let manager = DbManager::default();
+        // 1. 初回の接続でコマンドが 1 回走る
+        assert_eq!(manager.with_pool(&server, current_user).await.unwrap(), role);
+        assert_eq!(runs(), 1);
+        // プールがある間は走らない
+        manager.with_pool(&server, current_user).await.unwrap();
+        assert_eq!(runs(), 1);
+
+        // 2. パスワードを変える → 認証エラー → 取り直して再試行で繋がる
+        sqlx::query(&format!("ALTER ROLE {role} PASSWORD 'second-pw'"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        std::fs::write(&password_file, "second-pw\n").unwrap();
+        kick().await;
+        assert_eq!(manager.with_pool(&server, current_user).await.unwrap(), role);
+        assert_eq!(runs(), 2);
+
+        // 3. 取り直しても違えば 1 回だけ再試行して失敗を返す
+        std::fs::write(&password_file, "wrong-pw\n").unwrap();
+        sqlx::query(&format!("ALTER ROLE {role} PASSWORD 'third-pw'"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        kick().await;
+        let err = manager.with_pool(&server, current_user).await.unwrap_err();
+        assert_eq!(db_error_code(&err), DbErrorCode::Postgres("28P01"), "{err}");
+        assert_eq!(runs(), 3);
+        // エラーにパスワード (コマンドの出力) は載らない
+        assert!(!err.to_string().contains("wrong-pw"), "{err}");
+
+        // 4. 静的な password は再試行しない。プールを作った後でパスワードが
+        //    変わると、新しいコネクションの認証エラーをそのまま返す
+        let mut static_server = server.clone();
+        static_server.name = "static".into();
+        static_server.password_command = None;
+        static_server.password = Some("third-pw".into());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let calls = &calls;
+        let counted = |pool: DbPool| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            current_user(pool).await
+        };
+        manager.with_pool(&static_server, counted).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        sqlx::query(&format!("ALTER ROLE {role} PASSWORD 'fourth-pw'"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        kick().await;
+        let err = manager.with_pool(&static_server, counted).await.unwrap_err();
+        assert_eq!(db_error_code(&err), DbErrorCode::Postgres("28P01"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // password_command は一度も走っていない
+        assert_eq!(runs(), 3);
+
+        manager.reset().await;
+        kick().await;
+        sqlx::query(&format!("DROP ROLE {role}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+
+    /// password_command が遅くても、確立済みの別の接続のプール取得は待たされない
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_slow_password_command_does_not_block_other_connections() {
+        let manager = std::sync::Arc::new(DbManager::default());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fast.db");
+        std::fs::File::create(&db_path).unwrap();
+        let fast: ServerConfig = serde_yaml::from_str(&format!(
+            "name: fast\nengine: sqlite\nschema: {}\n",
+            db_path.display()
+        ))
+        .unwrap();
+        manager.get_pool(&fast).await.unwrap();
+
+        // 3 秒かかる password_command (接続先は存在しないが、コマンドの完了前に
+        // 試されることはない)
+        let slow: ServerConfig = serde_yaml::from_str(
+            "name: slow\nengine: postgres\nhost: 127.0.0.1\nport: 1\n\
+             password_command: /bin/sleep 3\n",
+        )
+        .unwrap();
+        let slow_manager = manager.clone();
+        let slow_task = tokio::spawn(async move { slow_manager.get_pool(&slow).await });
+        // slow 側がコマンドを走らせ始めるのを待つ
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let started = std::time::Instant::now();
+        manager.get_pool(&fast).await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "fast connection waited {:?}",
+            started.elapsed()
+        );
+        slow_task.abort();
     }
 }

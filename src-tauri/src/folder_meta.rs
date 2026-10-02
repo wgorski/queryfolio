@@ -124,6 +124,7 @@ mod tests {
             schema: Some("orders".to_string()),
             user: Some("app".to_string()),
             password: Some("s3cret".to_string()),
+            password_command: None,
             ssh_tunnel: None,
             tls: false,
             ssl_mode: None,

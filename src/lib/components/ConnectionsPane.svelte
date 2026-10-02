@@ -43,6 +43,8 @@
         rows.push({ label: "Port", value: String(c.port) });
       }
       if (c.user) rows.push({ label: "User", value: c.user });
+      // password_command の接続は「コマンドで取得する」ことだけを示す
+      if (c.password_from_command) rows.push({ label: "Password", value: "(command)" });
       if (c.schema) rows.push({ label: "Database", value: c.schema });
     }
     if (c.ssh_tunnel) {

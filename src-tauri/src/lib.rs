@@ -374,8 +374,12 @@ impl AppState {
         {
             return Ok(map);
         }
-        let pool = self.db.get_pool(server).await?;
-        let all = schema_info::fetch_all_columns(&pool).await?;
+        let all = self
+            .db
+            .with_pool(server, |pool| async move {
+                schema_info::fetch_all_columns(&pool).await
+            })
+            .await?;
         let map = all
             .iter()
             .map(|(table, columns)| {
@@ -533,18 +537,23 @@ async fn run_query(
         {
             return switch_active_schema(&state, &server, schema, started).await;
         }
-        let pool: DbPool = state.db.get_pool(&server).await?;
-        db::run_query_cancellable(
-            &pool,
-            &state.query_cancels,
-            &connection,
-            &sql,
-            max_rows,
-            auto_limit,
-            readonly_guard,
-            server.allow_dangerous_statements,
-        )
-        .await
+        let (cancels, connection, sql) = (&state.query_cancels, &connection, &sql);
+        state
+            .db
+            .with_pool(&server, |pool: DbPool| async move {
+                db::run_query_cancellable(
+                    &pool,
+                    cancels,
+                    connection,
+                    sql,
+                    max_rows,
+                    auto_limit,
+                    readonly_guard,
+                    server.allow_dangerous_statements,
+                )
+                .await
+            })
+            .await
     }
     .await;
 
@@ -613,18 +622,24 @@ async fn switch_active_schema(
                 ));
             }
         };
-        db::run_query_cancellable(
-            &pool,
-            &state.query_cancels,
-            &server.name,
-            sql,
-            DEFAULT_MAX_ROWS,
-            None,
-            // 確認用の SELECT なので readonly 接続でも通る
-            db::ReadonlyGuard::Config,
-            false,
-        )
-        .await
+        let cancels = &state.query_cancels;
+        state
+            .db
+            .retry_on_expired_password(server, pool, |pool| async move {
+                db::run_query_cancellable(
+                    &pool,
+                    cancels,
+                    &server.name,
+                    sql,
+                    DEFAULT_MAX_ROWS,
+                    None,
+                    // 確認用の SELECT なので readonly 接続でも通る
+                    db::ReadonlyGuard::Config,
+                    false,
+                )
+                .await
+            })
+            .await
     }
     .await;
 
@@ -926,8 +941,11 @@ async fn list_schemas(
     connection: String,
 ) -> Result<Vec<String>, AppError> {
     let server = state.find_server(&connection).await?;
-    let pool = state.db.get_pool(&server).await?;
-    db::list_schemas(&pool, &server).await
+    let server = &server;
+    state
+        .db
+        .with_pool(server, |pool| async move { db::list_schemas(&pool, server).await })
+        .await
 }
 
 /// 接続のアクティブスキーマ (database) を切り替える。
@@ -997,8 +1015,10 @@ async fn list_tables(
     } else if let Some(tables) = state.schema_cache.get_tables(&connection, &schema_key).await {
         return Ok(tables);
     }
-    let pool = state.db.get_pool(&server).await?;
-    let tables = schema_info::fetch_tables(&pool).await?;
+    let tables = state
+        .db
+        .with_pool(&server, |pool| async move { schema_info::fetch_tables(&pool).await })
+        .await?;
     state
         .schema_cache
         .put_tables(&connection, &schema_key, &tables)
@@ -1023,8 +1043,13 @@ async fn list_columns(
     {
         return Ok(columns);
     }
-    let pool = state.db.get_pool(&server).await?;
-    let columns = schema_info::fetch_columns(&pool, &table).await?;
+    let table_name = &table;
+    let columns = state
+        .db
+        .with_pool(&server, |pool| async move {
+            schema_info::fetch_columns(&pool, table_name).await
+        })
+        .await?;
     state
         .schema_cache
         .put_columns(&connection, &schema_key, &table, &columns)
@@ -1053,8 +1078,13 @@ async fn get_primary_keys(
     table: String,
 ) -> Result<Vec<String>, AppError> {
     let server = state.find_server(&connection).await?;
-    let pool = state.db.get_pool(&server).await?;
-    schema_info::fetch_primary_keys(&pool, &table).await
+    let table = &table;
+    state
+        .db
+        .with_pool(&server, |pool| async move {
+            schema_info::fetch_primary_keys(&pool, table).await
+        })
+        .await
 }
 
 /// 結果グリッドのセル編集を UPDATE 群として 1 トランザクションで適用する。
@@ -1075,14 +1105,13 @@ async fn run_statements(
     } else {
         db::ReadonlyGuard::Switch
     };
-    let pool = state.db.get_pool(&server).await?;
-    db::run_statements(
-        &pool,
-        &statements,
-        readonly_guard,
-        server.allow_dangerous_statements,
-    )
-    .await
+    let (statements, allow_dangerous) = (&statements, server.allow_dangerous_statements);
+    state
+        .db
+        .with_pool(&server, |pool| async move {
+            db::run_statements(&pool, statements, readonly_guard, allow_dangerous).await
+        })
+        .await
 }
 
 /// AI 設定の情報 (configured / model) を返す。api_key は含めない。
@@ -1464,16 +1493,28 @@ async fn run_ai_chat(
                             // クエリの future を drop して待つのをやめる
                             // (サーバー側は登録済みなら停止し、未登録なら
                             //  クライアント側の打ち切りになる)
-                            let query = db::run_query_cancellable(
-                                &pool,
-                                &state.query_cancels,
-                                &cancel_key,
-                                &sql,
-                                ai::CHAT_TOOL_MAX_ROWS,
-                                None,
-                                readonly_guard,
-                                // エージェントには危険な文も許可しない
-                                false,
+                            // password_command の期限切れによる認証エラーは
+                            // パスワードを取り直して 1 度だけ再実行する
+                            // (その間の中断も下のポーリングが拾う)
+                            let (cancels, cancel_key, sql) =
+                                (&state.query_cancels, &cancel_key, &sql);
+                            let query = state.db.retry_on_expired_password(
+                                &server,
+                                pool,
+                                |pool| async move {
+                                    db::run_query_cancellable(
+                                        &pool,
+                                        cancels,
+                                        cancel_key,
+                                        sql,
+                                        ai::CHAT_TOOL_MAX_ROWS,
+                                        None,
+                                        readonly_guard,
+                                        // エージェントには危険な文も許可しない
+                                        false,
+                                    )
+                                    .await
+                                },
                             );
                             tokio::pin!(query);
                             loop {

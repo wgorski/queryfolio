@@ -1077,6 +1077,7 @@ mod tests {
             schema: None,
             user: None,
             password: None,
+            password_command: None,
             ssh_tunnel: None,
             readonly: false,
             allow_dangerous_statements: false,

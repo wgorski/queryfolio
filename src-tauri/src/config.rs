@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
-/// config_override_command の実行タイムアウト (秒)。
+/// config_override_command / password_command の実行タイムアウト (秒)。
 /// 1Password 等の認証待ちで無限ハングするとコマンド呼び出しが固まるため必須。
 const SOURCE_COMMAND_TIMEOUT_SECS: u64 = 60;
 
@@ -259,6 +259,14 @@ pub struct ServerConfig {
     pub user: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    /// queryfolio 独自拡張: 接続時にパスワードを取得するコマンド。
+    /// stdout (末尾の改行を除く) をパスワードとして使う。設定の読み込み時や
+    /// 接続の選択時には実行せず、DbManager::get_pool が新しいプールを作る時
+    /// (と、認証エラーからの復帰時) にだけ実行する。password との併記と、
+    /// パスワードを使わないエンジン (sqlite / duckdb) での指定はエラー
+    /// (password_command を参照)。
+    #[serde(default)]
+    pub password_command: Option<String>,
     #[serde(default)]
     pub ssh_tunnel: Option<SshTunnelConfig>,
     /// queryfolio 独自拡張: true の場合、HTTP 系エンジン (elasticsearch) の
@@ -444,6 +452,45 @@ impl ServerConfig {
         Ok(Some(raw))
     }
 
+    /// password_command の設定値を返す (未設定なら None)。
+    ///
+    /// 次の場合はエラーにする (ssl_root_cert と同じく接続時に検証する。
+    /// 設定の読み込み時に弾くと、1 接続の誤りで接続一覧ごと失われるため):
+    /// - password と併記されている。どちらかを黙って優先すると、書いた方の
+    ///   設定が効いていないことに気付けない (テンプレートの password を
+    ///   打ち消したい場合は `password: null` と書く)
+    /// - パスワードを使わないエンジン (sqlite / duckdb)
+    /// - 空文字 (書いたつもりの設定を「未設定」に倒さない)
+    pub fn password_command(&self) -> Result<Option<&str>, AppError> {
+        let Some(raw) = self.password_command.as_deref() else {
+            return Ok(None);
+        };
+        let command = raw.trim();
+        if command.is_empty() {
+            return Err(AppError::Config(format!(
+                "Server '{}': password_command is empty",
+                self.name
+            )));
+        }
+        if self.password.is_some() {
+            return Err(AppError::Config(format!(
+                "Server '{}': set either password or password_command, not both \
+                 (to drop a password inherited from a template, write `password: null`)",
+                self.name
+            )));
+        }
+        if let Ok(crate::db::Engine::Sqlite | crate::db::Engine::DuckDb) =
+            crate::db::parse_engine(&self.engine)
+        {
+            return Err(AppError::Config(format!(
+                "Server '{}': password_command cannot be used with {} \
+                 (the engine does not use a password)",
+                self.name, self.engine
+            )));
+        }
+        Ok(Some(command))
+    }
+
     /// クエリファイルの保存フォルダ名を返す。
     /// folder_name が設定されていればそれを使い、無ければ
     /// <host>_<engine>_<schema>_<user> を組み立てる (name は使わない)。
@@ -542,6 +589,9 @@ pub struct ConnectionInfo {
     pub allow_dangerous_statements: bool,
     /// 接続一覧での表示グループ名 (グループ未所属なら null)
     pub group_name: Option<String>,
+    /// パスワードを password_command で取得する接続か。
+    /// コマンドの文字列も出力も渡さない (表示は「コマンド由来」の事実だけ)
+    pub password_from_command: bool,
     /// 実効 TLS モード (SqlSslMode の文字列表現)。
     /// mysql / postgres は ssl_mode / tls から解決した値、redis は tls: true なら
     /// verify-full (証明書もホスト名も検証する)、false なら disable。
@@ -569,6 +619,7 @@ impl From<&ServerConfig> for ConnectionInfo {
             readonly: server.readonly,
             allow_dangerous_statements: server.allow_dangerous_statements,
             group_name: server.group_name.clone(),
+            password_from_command: server.password_command.is_some(),
             // エンジン名の別名 (mariadb / postgresql) も拾うため parse_engine を通す。
             // エンジン名や ssl_mode の値が不正な設定は接続時にエラーになるので、
             // ここでは表示を諦めて null にする
@@ -1090,26 +1141,76 @@ fn parse_server_entry(
 }
 
 /// config_override_command を実行して stdout を返す。
+async fn run_source_command(command: &str) -> Result<String, AppError> {
+    let stdout = run_setting_command(
+        command,
+        CONFIG_OVERRIDE_COMMAND_KEY,
+        Duration::from_secs(SOURCE_COMMAND_TIMEOUT_SECS),
+    )
+    .await?;
+    Ok(String::from_utf8_lossy(&stdout).to_string())
+}
+
+/// 接続の password_command を実行してパスワードを返す。
+///
+/// パスワードは stdout から末尾の `\r` / `\n` だけを取り除いたもの。それ以外は
+/// 一切触らない (RDS の IAM 認証トークンは `&` `=` `%` を含むため、trim や
+/// デコードをすると別の文字列になる)。
+///
+/// **stdout の中身はエラーメッセージにも出さない** (パスワードそのものなので)。
+/// エラーに載せるのはコマンドと終了コード・stderr だけ。
+pub async fn run_password_command(server_name: &str, command: &str) -> Result<String, AppError> {
+    run_password_command_with_timeout(
+        server_name,
+        command,
+        Duration::from_secs(SOURCE_COMMAND_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn run_password_command_with_timeout(
+    server_name: &str,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, AppError> {
+    let setting = format!("password_command of server '{server_name}'");
+    let stdout = run_setting_command(command, &setting, timeout).await?;
+    // lossy 変換すると不正なバイトが U+FFFD に化けた「違うパスワード」で
+    // 認証を試みることになるので、UTF-8 でなければエラーにする
+    let stdout = String::from_utf8(stdout)
+        .map_err(|_| AppError::Config(format!("{setting} printed non-UTF-8 output: {command}")))?;
+    Ok(stdout.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// 設定に書かれたコマンド (config_override_command / password_command) を
+/// 実行して stdout を返す。setting はエラーメッセージで設定項目を名指すラベル。
 ///
 /// shlex で argv に分解し、シェルを介さず実行する。シェルメタ文字が混入しても
 /// 解釈されないためコマンドインジェクションの余地が無い。その代わり
 /// パイプ・リダイレクト・変数展開は使えない (単一コマンド前提)。
-async fn run_source_command(command: &str) -> Result<String, AppError> {
+///
+/// エラーメッセージにはコマンドと stderr を載せるが、**stdout は載せない**
+/// (password_command の stdout はパスワードそのもの)。
+async fn run_setting_command(
+    command: &str,
+    setting: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, AppError> {
     let argv = shlex::split(command).ok_or_else(|| {
         AppError::Config(format!(
-            "Failed to parse config_override_command (unbalanced quotes?): {command}"
+            "Failed to parse {setting} (unbalanced quotes?): {command}"
         ))
     })?;
     if argv.is_empty() {
-        return Err(AppError::Config("config_override_command is empty".into()));
+        return Err(AppError::Config(format!("{setting} is empty")));
     }
 
     let output = tokio::time::timeout(
-        Duration::from_secs(SOURCE_COMMAND_TIMEOUT_SECS),
+        timeout,
         tokio::process::Command::new(&argv[0])
             .args(&argv[1..])
             // Finder / Dock から起動した GUI の PATH は最小構成 (/usr/bin:/bin 等) で、
-            // Homebrew の op 等が見つからないため定番パスを補う
+            // Homebrew の op / aws 等が見つからないため定番パスを補う
             .env("PATH", supplemented_path())
             // タイムアウトで future が drop された時に子プロセスを残さない
             // (認証待ちでハングした op が遺児化し、リトライで多重起動するのを防ぐ)
@@ -1119,30 +1220,28 @@ async fn run_source_command(command: &str) -> Result<String, AppError> {
     .await
     .map_err(|_| {
         AppError::Config(format!(
-            "config_override_command timed out ({SOURCE_COMMAND_TIMEOUT_SECS}s): {command} \
-             (it may be hanging on 1Password or another auth prompt)"
+            "{setting} timed out ({}s): {command} \
+             (it may be hanging on 1Password or another auth prompt)",
+            timeout.as_secs_f64()
         ))
     })?
-    .map_err(|e| {
-        AppError::Config(format!("Failed to run config_override_command: {command}: {e}"))
-    })?;
+    .map_err(|e| AppError::Config(format!("Failed to run {setting}: {command}: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::Config(format!(
-            "config_override_command exited with an error (code={:?}): {command}\nstderr: {}",
+            "{setting} exited with an error (code={:?}): {command}\nstderr: {}",
             output.status.code(),
             stderr.trim()
         )));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if stdout.trim().is_empty() {
+    if output.stdout.iter().all(u8::is_ascii_whitespace) {
         return Err(AppError::Config(format!(
-            "config_override_command produced no output: {command}"
+            "{setting} produced no output: {command}"
         )));
     }
-    Ok(stdout)
+    Ok(output.stdout)
 }
 
 /// PATH に Homebrew 等の定番ディレクトリを補ったものを返す。
@@ -2006,6 +2105,7 @@ servers:
             schema: Some("db".into()),
             user: Some("u".into()),
             password: Some("secret".into()),
+            password_command: None,
             ssh_tunnel: None,
             tls: false,
             ssl_mode: None,
@@ -2018,6 +2118,182 @@ servers:
         let info = ConnectionInfo::from(&server);
         let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains("secret"));
+    }
+
+    /// servers の 1 エントリ目を解決する (テンプレート展開込み)
+    fn first_server(yaml: &str) -> ServerConfig {
+        config_from_yaml(yaml)
+            .resolve_servers()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_password_command_is_read() {
+        let server = first_server(
+            "servers:\n  - name: iam\n    engine: postgres\n    host: h\n    user: u\n    \
+             password_command: aws rds generate-db-auth-token --hostname h\n",
+        );
+        assert_eq!(
+            server.password_command().unwrap(),
+            Some("aws rds generate-db-auth-token --hostname h")
+        );
+        assert!(server.password.is_none());
+        // 未設定なら None (従来どおり password を使う)
+        let plain = first_server(
+            "servers:\n  - name: p\n    engine: postgres\n    password: secret\n",
+        );
+        assert_eq!(plain.password_command().unwrap(), None);
+    }
+
+    #[test]
+    fn test_password_and_password_command_together_is_error() {
+        let server = first_server(
+            "servers:\n  - name: both\n    engine: mysql\n    password: secret\n    \
+             password_command: /bin/echo x\n",
+        );
+        let err = server.password_command().unwrap_err().to_string();
+        assert!(err.contains("either password or password_command"), "{err}");
+        assert!(err.contains("'both'"), "{err}");
+    }
+
+    #[test]
+    fn test_password_command_is_rejected_for_file_engines() {
+        for engine in ["sqlite", "sqlite3", "duckdb"] {
+            let server = first_server(&format!(
+                "servers:\n  - name: f\n    engine: {engine}\n    schema: /tmp/x.db\n    \
+                 password_command: /bin/echo x\n"
+            ));
+            let err = server.password_command().unwrap_err().to_string();
+            assert!(err.contains("cannot be used with"), "{engine}: {err}");
+        }
+        // パスワードを使うエンジンでは受け付ける
+        for engine in ["mysql", "postgres", "redis", "elasticsearch", "dynamodb"] {
+            let server = first_server(&format!(
+                "servers:\n  - name: n\n    engine: {engine}\n    \
+                 password_command: /bin/echo x\n"
+            ));
+            assert!(server.password_command().unwrap().is_some(), "{engine}");
+        }
+    }
+
+    #[test]
+    fn test_blank_password_command_is_error() {
+        let server = first_server(
+            "servers:\n  - name: b\n    engine: postgres\n    password_command: \"  \"\n",
+        );
+        assert!(server.password_command().unwrap_err().to_string().contains("is empty"));
+    }
+
+    #[test]
+    fn test_password_command_is_inherited_from_template() {
+        let yaml = "servers:\n  - name: qa\n    template: iam\n    host: qa-db\n\
+                    server_templates:\n  - name: iam\n    engine: postgres\n    user: iam_ro\n    \
+                    password_command: /usr/local/bin/token --user iam_ro\n";
+        let server = first_server(yaml);
+        assert_eq!(server.name, "qa");
+        assert_eq!(
+            server.password_command().unwrap(),
+            Some("/usr/local/bin/token --user iam_ro")
+        );
+
+        // テンプレートの password とサーバー側の password_command は併記扱い
+        // (どちらかを黙って優先しない)。password: null で打ち消せる
+        let base = "server_templates:\n  - name: t\n    engine: postgres\n    password: shared\n";
+        let both = first_server(&format!(
+            "servers:\n  - name: s\n    template: t\n    password_command: /bin/echo x\n{base}"
+        ));
+        assert!(both.password_command().is_err());
+        let overridden = first_server(&format!(
+            "servers:\n  - name: s\n    template: t\n    password: null\n    \
+             password_command: /bin/echo x\n{base}"
+        ));
+        assert_eq!(overridden.password_command().unwrap(), Some("/bin/echo x"));
+    }
+
+    #[test]
+    fn test_connection_info_marks_password_command_without_the_command() {
+        let server = first_server(
+            "servers:\n  - name: iam\n    engine: postgres\n    \
+             password_command: /opt/secret-fetcher --token-for prod\n",
+        );
+        let info = ConnectionInfo::from(&server);
+        assert!(info.password_from_command);
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("secret-fetcher"), "{json}");
+
+        let plain = first_server("servers:\n  - name: p\n    engine: postgres\n");
+        assert!(!ConnectionInfo::from(&plain).password_from_command);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_trims_only_trailing_newlines() {
+        // RDS の IAM トークンのように & = % を含む値。前後の空白や途中の
+        // 文字はそのまま残し、末尾の \r\n だけを落とす
+        let password = run_password_command(
+            "iam",
+            r"/usr/bin/printf ' tok&en=a%%2Fb?X-Amz-Signature=ab== \r\n\n'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(password, " tok&en=a%2Fb?X-Amz-Signature=ab== ");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_empty_output_is_error() {
+        for command in ["/usr/bin/true", r"/usr/bin/printf '\n'"] {
+            let err = run_password_command("iam", command).await.unwrap_err().to_string();
+            assert!(err.contains("produced no output"), "{command}: {err}");
+            assert!(err.contains("password_command of server 'iam'"), "{err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_failure_shows_stderr_but_not_stdout() {
+        // stdout は "hunter2"。コマンド自体はエラーに載ってよいので、コマンドの
+        // 文字列には "hunter2" が現れないように組み立てる
+        let err = run_password_command(
+            "iam",
+            "/bin/sh -c 'printf %s%s hunter 2; echo token expired >&2; exit 3'",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("password_command of server 'iam'"), "{err}");
+        assert!(err.contains("code=Some(3)"), "{err}");
+        assert!(err.contains("token expired"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_timeout() {
+        let started = std::time::Instant::now();
+        let err = run_password_command_with_timeout(
+            "iam",
+            "/bin/sleep 10",
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("timed out (0.2s)"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_rejects_non_utf8_output() {
+        let err = run_password_command("iam", r"/usr/bin/printf '\377\376'")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-UTF-8"), "{err}");
     }
 
     fn server_with(
@@ -2037,6 +2313,7 @@ servers:
             schema: schema.map(|s| s.to_string()),
             user: user.map(|s| s.to_string()),
             password: None,
+            password_command: None,
             ssh_tunnel: None,
             tls: false,
             ssl_mode: None,
@@ -2197,6 +2474,7 @@ servers:
             schema: Some("ap-northeast-1".into()),
             user: Some("AKIAEXAMPLEKEYID".into()),
             password: Some("secret".into()),
+            password_command: None,
             ssh_tunnel: None,
             readonly: false,
             allow_dangerous_statements: false,

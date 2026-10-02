@@ -229,6 +229,33 @@ servers:
 #     engine: sqlite
 #     schema: ~/data/example.sqlite3
 
+# --- servers: 接続時にパスワードを取得する (password_command、queryfolio 拡張) ---
+# password の代わりに password_command を書くと、その接続を開く時にコマンドを
+# 実行し、stdout (末尾の改行を除く) をパスワードとして使う。設定の読み込み時や
+# 接続を選択しただけでは実行せず、他の接続の分も実行しない。
+# RDS の IAM 認証トークン (有効 15 分) のような期限付きの資格情報向け。
+#
+# - password との併記はエラー (テンプレートの password を打ち消すなら password: null)
+# - sqlite / duckdb では使えない (パスワードを使わないため)
+# - postgres / mysql は認証エラー (期限切れ) になると、コマンドを実行し直して
+#   1 度だけ再試行する (SSH トンネルとプールはそのまま)
+# - コマンドはシェル非経由で実行される (パイプやリダイレクトは使えない。
+#   必要ならラッパースクリプトを書く)。タイムアウトは 60 秒
+#
+# servers:
+#   - name: staging-iam
+#     engine: postgres
+#     host: mydb.example.com
+#     port: 5432
+#     schema: appdb
+#     user: iam_user
+#     password_command: aws rds generate-db-auth-token --hostname mydb.example.com --port 5432 --username iam_user --region us-east-1 --profile staging
+#     ssl_mode: require
+#     ssh_tunnel:
+#       host: bastion.example.com
+#       user: ec2-user
+#       private_key_path: ~/.ssh/id_rsa
+
 # --- 設定を外部から上書きする (任意) ---
 # config_override_command に書いたコマンドを実行し、その stdout (YAML) を
 # この設定へ再帰的にマージする。取得した YAML 側が優先。
